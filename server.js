@@ -1,4 +1,4 @@
-// server.js — Biblioteca Obsidiana Backend V2.4
+// server.js — Biblioteca Obsidiana Backend V2.4.1
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
@@ -118,8 +118,8 @@ async function seedFixedAdmins(){
 }
 seedFixedAdmins().catch(e => console.error("Erro ao criar admins fixos:", e));
 
-app.get("/", (req, res) => res.json({ ok:true, name:"Biblioteca Obsidiana Backend V2.4" }));
-app.get("/health", (req, res) => res.json({ ok:true, status:"online", version:"2.4" }));
+app.get("/", (req, res) => res.json({ ok:true, name:"Biblioteca Obsidiana Backend V2.4.1" }));
+app.get("/health", (req, res) => res.json({ ok:true, status:"online", version:"2.4.1" }));
 
 app.get("/public/free-slots", async (req, res) => {
   const { count, error } = await supabase
@@ -215,29 +215,12 @@ app.post("/create-preference", async (req, res) => {
     const planDays = Number(req.body.planDays || 30);
 
     if(!userEmail) return res.status(400).json({ ok:false, error:"Falta userEmail." });
+    if(![30,60,90].includes(planDays)) return res.status(400).json({ ok:false, error:"Plano inválido." });
 
     const price = await getPlanPrice(planDays);
 
     const siteUrl = SITE_URL || "https://francisco123-criador.github.io/Biblioteca-Obsidiana-1.0";
     const backendUrl = BACKEND_PUBLIC_URL || "https://backend-biblioteca-obsidiana.onrender.com";
-
-    const { data: currentBeforePay } = await supabase.from("bo_profiles").select("*").eq("email", userEmail).maybeSingle();
-
-    if(!currentBeforePay){
-      await supabase.from("bo_profiles").insert({
-        email:userEmail,
-        role:"user",
-        status:"pending_payment",
-        free_trial_granted:false,
-        plan_days:0,
-        updated_at:new Date().toISOString()
-      });
-    }else if(currentBeforePay.role !== "admin" && !currentBeforePay.is_lifetime){
-      await supabase.from("bo_profiles").update({
-        status:"pending_payment",
-        updated_at:new Date().toISOString()
-      }).eq("email", userEmail);
-    }
 
     const preference = new Preference(mpClient);
 
@@ -658,4 +641,4 @@ app.post("/admin/stop-promo", requireAdmin, async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Biblioteca Obsidiana V2.4 online na porta ${port}`));
+app.listen(port, () => console.log(`Biblioteca Obsidiana V2.4.1 online na porta ${port}`));
