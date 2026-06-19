@@ -1,4 +1,4 @@
-// server.js — Biblioteca Obsidiana Backend V2.4.1
+// server.js — Biblioteca Obsidiana Backend V2.4.3
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
@@ -118,16 +118,18 @@ async function seedFixedAdmins(){
 }
 seedFixedAdmins().catch(e => console.error("Erro ao criar admins fixos:", e));
 
-app.get("/", (req, res) => res.json({ ok:true, name:"Biblioteca Obsidiana Backend V2.4.1" }));
-app.get("/health", (req, res) => res.json({ ok:true, status:"online", version:"2.4.1" }));
+app.get("/", (req, res) => res.json({ ok:true, name:"Biblioteca Obsidiana Backend V2.4.3" }));
+app.get("/health", (req, res) => res.json({ ok:true, status:"online", version:"2.4.3" }));
 
 app.get("/public/free-slots", async (req, res) => {
   const { count, error } = await supabase
     .from("bo_profiles")
     .select("*", { count:"exact", head:true })
-    .eq("free_trial_granted", true);
+    .eq("free_trial_granted", true)
+    .neq("created_by", "free_promo");
 
   if(error) return res.status(500).json({ ok:false, error:error.message });
+
   const used = Number(count || 0);
   res.json({ ok:true, free_used: used, free_remaining: Math.max(0, 100 - used), free_limit: 100 });
 });
@@ -144,40 +146,110 @@ app.post("/signup", async (req, res) => {
     const { data: existing } = await supabase.from("bo_profiles").select("*").eq("email", email).maybeSingle();
     if(existing) return res.status(409).json({ ok:false, error:"Este e-mail já está cadastrado." });
 
-    const { count } = await supabase.from("bo_profiles").select("*", { count:"exact", head:true }).eq("free_trial_granted", true);
+    const { count } = await supabase
+      .from("bo_profiles")
+      .select("*", { count:"exact", head:true })
+      .eq("free_trial_granted", true)
+      .neq("created_by", "free_promo");
+
     const freeUsed = Number(count || 0);
-    const freeTrialGranted = freeUsed < 100;
-    const freeTrialNumber = freeTrialGranted ? freeUsed + 1 : null;
 
-    const profile = {
-      email,
-      whatsapp,
-      pin_hash: hashPin(pin),
-      role:"user",
-      status: freeTrialGranted ? "active" : "pending_payment",
-      is_fixed_admin:false,
-      is_lifetime:false,
-      free_trial_granted: freeTrialGranted,
-      free_trial_number: freeTrialNumber,
-      plan_days: freeTrialGranted ? 30 : 0,
-      expires_at: freeTrialGranted ? addDays(new Date(), 30) : null,
-      created_by:"self",
-      updated_at:new Date().toISOString()
-    };
+    if(freeUsed < 100){
+      const freeTrialNumber = freeUsed + 1;
 
-    const { data, error } = await supabase.from("bo_profiles").insert(profile).select("*").single();
-    if(error) throw error;
+      const profile = {
+        email,
+        whatsapp,
+        pin_hash: hashPin(pin),
+        role:"user",
+        status:"active",
+        is_fixed_admin:false,
+        is_lifetime:false,
+        free_trial_granted:true,
+        free_trial_number:freeTrialNumber,
+        plan_days:30,
+        expires_at:addDays(new Date(), 30),
+        created_by:"self",
+        updated_at:new Date().toISOString()
+      };
 
-    const token = signToken({ email:data.email, role:data.role });
+      const { data, error } = await supabase.from("bo_profiles").insert(profile).select("*").single();
+      if(error) throw error;
 
-    res.json({
+      const token = signToken({ email:data.email, role:data.role });
+
+      return res.json({
+        ok:true,
+        profile:data,
+        token,
+        freeTrialGranted:true,
+        freeTrialNumber,
+        freeRemaining: Math.max(0, 100 - freeTrialNumber)
+      });
+    }
+
+    const nowIso = new Date().toISOString();
+
+    const { data: promo } = await supabase
+      .from("bo_free_access_promos")
+      .select("*")
+      .eq("enabled", true)
+      .lte("starts_at", nowIso)
+      .gte("ends_at", nowIso)
+      .order("created_at", { ascending:false })
+      .limit(1)
+      .maybeSingle();
+
+    if(promo && Number(promo.used_slots || 0) < Number(promo.extra_slots || 0)){
+      const days = Number(promo.free_days || 30);
+
+      const profile = {
+        email,
+        whatsapp,
+        pin_hash: hashPin(pin),
+        role:"user",
+        status:"active",
+        is_fixed_admin:false,
+        is_lifetime:false,
+        free_trial_granted:true,
+        free_trial_number:null,
+        plan_days:days,
+        expires_at:addDays(new Date(), days),
+        created_by:"free_promo",
+        updated_at:new Date().toISOString()
+      };
+
+      const { data, error } = await supabase.from("bo_profiles").insert(profile).select("*").single();
+      if(error) throw error;
+
+      await supabase
+        .from("bo_free_access_promos")
+        .update({
+          used_slots:Number(promo.used_slots || 0) + 1,
+          updated_at:new Date().toISOString()
+        })
+        .eq("id", promo.id);
+
+      const token = signToken({ email:data.email, role:data.role });
+
+      return res.json({
+        ok:true,
+        profile:data,
+        token,
+        freeTrialGranted:true,
+        freePromoGranted:true,
+        message:"Acesso grátis promocional liberado."
+      });
+    }
+
+    return res.json({
       ok:true,
-      profile:data,
-      token,
-      freeTrialGranted,
-      freeTrialNumber,
-      freeRemaining: Math.max(0, 100 - (freeUsed + (freeTrialGranted ? 1 : 0)))
+      paymentRequired:true,
+      message:"Os 100 acessos grátis acabaram. Continue para o pagamento.",
+      email,
+      whatsapp
     });
+
   }catch(error){
     console.error(error);
     res.status(500).json({ ok:false, error:"Erro ao cadastrar: " + error.message });
@@ -213,9 +285,21 @@ app.post("/create-preference", async (req, res) => {
   try{
     const userEmail = normEmail(req.body.userEmail);
     const planDays = Number(req.body.planDays || 30);
+    const whatsapp = String(req.body.whatsapp || "").trim();
+    const pin = String(req.body.pin || "").trim();
 
     if(!userEmail) return res.status(400).json({ ok:false, error:"Falta userEmail." });
     if(![30,60,90].includes(planDays)) return res.status(400).json({ ok:false, error:"Plano inválido." });
+
+    const { data: existing } = await supabase
+      .from("bo_profiles")
+      .select("*")
+      .eq("email", userEmail)
+      .maybeSingle();
+
+    if(!existing && !validPin(pin)){
+      return res.status(400).json({ ok:false, error:"Para criar conta paga, informe uma senha de 4 números." });
+    }
 
     const price = await getPlanPrice(planDays);
 
@@ -223,6 +307,13 @@ app.post("/create-preference", async (req, res) => {
     const backendUrl = BACKEND_PUBLIC_URL || "https://backend-biblioteca-obsidiana.onrender.com";
 
     const preference = new Preference(mpClient);
+
+    const metadata = {
+      user_email:userEmail,
+      plan_days:planDays,
+      whatsapp,
+      pin_hash: existing?.pin_hash || hashPin(pin)
+    };
 
     const result = await preference.create({
       body: {
@@ -233,7 +324,7 @@ app.post("/create-preference", async (req, res) => {
           unit_price:price
         }],
         payer: { email:userEmail },
-        metadata: { user_email:userEmail, plan_days:planDays },
+        metadata,
         back_urls: {
           success:`${siteUrl}?payment=success`,
           failure:`${siteUrl}?payment=failure`,
@@ -272,6 +363,8 @@ app.post("/mercadopago-webhook", async (req, res) => {
 
     const userEmail = normEmail(info.metadata?.user_email);
     const planDays = Number(info.metadata?.plan_days || 30);
+    const whatsapp = String(info.metadata?.whatsapp || "").trim();
+    const pinHash = info.metadata?.pin_hash;
 
     if(!userEmail) return res.status(400).json({ ok:false, error:"Pagamento sem user_email." });
 
@@ -283,17 +376,27 @@ app.post("/mercadopago-webhook", async (req, res) => {
 
     const expiresAt = addDays(base, planDays);
 
-    const { error } = await supabase.from("bo_profiles").upsert({
+    const payload = {
       email:userEmail,
+      whatsapp: current?.whatsapp || whatsapp || "",
       role: current?.role || "user",
       status:"active",
+      is_fixed_admin: current?.is_fixed_admin || false,
       is_lifetime: current?.is_lifetime || false,
+      free_trial_granted: current?.free_trial_granted || false,
       plan_days:planDays,
       expires_at: current?.is_lifetime ? current.expires_at : expiresAt,
       last_payment_id:String(paymentId),
       updated_at:new Date().toISOString()
-    }, { onConflict:"email" });
+    };
 
+    if(current?.pin_hash){
+      payload.pin_hash = current.pin_hash;
+    }else if(pinHash){
+      payload.pin_hash = pinHash;
+    }
+
+    const { error } = await supabase.from("bo_profiles").upsert(payload, { onConflict:"email" });
     if(error) throw error;
 
     res.json({
@@ -309,11 +412,7 @@ app.post("/mercadopago-webhook", async (req, res) => {
 });
 
 app.get("/admin/users", requireAdmin, async (req, res) => {
-  const { data: users, error } = await supabase
-    .from("bo_profiles")
-    .select("*")
-    .order("created_at", { ascending:false });
-
+  const { data: users, error } = await supabase.from("bo_profiles").select("*").order("created_at", { ascending:false });
   if(error) return res.status(500).json({ ok:false, error:error.message });
 
   const now = Date.now();
@@ -324,8 +423,8 @@ app.get("/admin/users", requireAdmin, async (req, res) => {
     active: users.filter(u=>u.role==="admin" || u.is_lifetime || (u.status==="active" && u.expires_at && new Date(u.expires_at).getTime() > now)).length,
     expired: users.filter(u=>u.role!=="admin" && !u.is_lifetime && (!u.expires_at || new Date(u.expires_at).getTime() <= now)).length,
     blocked: users.filter(u=>u.status==="blocked").length,
-    free_used: users.filter(u=>u.free_trial_granted).length,
-    free_remaining: Math.max(0, 100 - users.filter(u=>u.free_trial_granted).length)
+    free_used: users.filter(u=>u.free_trial_granted && u.created_by !== "free_promo").length,
+    free_remaining: Math.max(0, 100 - users.filter(u=>u.free_trial_granted && u.created_by !== "free_promo").length)
   };
 
   res.json({ ok:true, users, stats });
@@ -361,12 +460,7 @@ app.post("/admin/create-user", requireAdmin, async (req, res) => {
 
     if(pin) payload.pin_hash = hashPin(pin);
 
-    const { data, error } = await supabase
-      .from("bo_profiles")
-      .upsert(payload, { onConflict:"email" })
-      .select("*")
-      .single();
-
+    const { data, error } = await supabase.from("bo_profiles").upsert(payload, { onConflict:"email" }).select("*").single();
     if(error) throw error;
 
     res.json({ ok:true, profile:data });
@@ -411,12 +505,7 @@ app.post("/admin/renew-user", requireAdmin, async (req, res) => {
     const days = Number(req.body.days || 30);
     const newPin = String(req.body.newPin || "").trim();
 
-    const { data: current, error: findErr } = await supabase
-      .from("bo_profiles")
-      .select("*")
-      .eq("email", email)
-      .single();
-
+    const { data: current, error: findErr } = await supabase.from("bo_profiles").select("*").eq("email", email).single();
     if(findErr || !current) return res.status(404).json({ ok:false, error:"Usuário não encontrado." });
 
     const base = current.expires_at && new Date(current.expires_at).getTime() > Date.now()
@@ -437,13 +526,7 @@ app.post("/admin/renew-user", requireAdmin, async (req, res) => {
       payload.pin_hash = hashPin(newPin);
     }
 
-    const { data, error } = await supabase
-      .from("bo_profiles")
-      .update(payload)
-      .eq("email", email)
-      .select("*")
-      .single();
-
+    const { data, error } = await supabase.from("bo_profiles").update(payload).eq("email", email).select("*").single();
     if(error) throw error;
 
     res.json({ ok:true, profile:data });
@@ -454,19 +537,16 @@ app.post("/admin/renew-user", requireAdmin, async (req, res) => {
 
 app.post("/admin/block-user", requireAdmin, async (req, res) => {
   const email = normEmail(req.body.email);
-
   const { data: current } = await supabase.from("bo_profiles").select("*").eq("email", email).single();
 
   if(current?.is_fixed_admin || isFixedAdminEmail(email)){
     return res.status(400).json({ ok:false, error:"Não é permitido bloquear administrador fixo." });
   }
 
-  const { data, error } = await supabase
-    .from("bo_profiles")
-    .update({ status:"blocked", updated_at:new Date().toISOString() })
-    .eq("email", email)
-    .select("*")
-    .single();
+  const { data, error } = await supabase.from("bo_profiles").update({
+    status:"blocked",
+    updated_at:new Date().toISOString()
+  }).eq("email", email).select("*").single();
 
   if(error) return res.status(500).json({ ok:false, error:error.message });
 
@@ -476,12 +556,10 @@ app.post("/admin/block-user", requireAdmin, async (req, res) => {
 app.post("/admin/unblock-user", requireAdmin, async (req, res) => {
   const email = normEmail(req.body.email);
 
-  const { data, error } = await supabase
-    .from("bo_profiles")
-    .update({ status:"active", updated_at:new Date().toISOString() })
-    .eq("email", email)
-    .select("*")
-    .single();
+  const { data, error } = await supabase.from("bo_profiles").update({
+    status:"active",
+    updated_at:new Date().toISOString()
+  }).eq("email", email).select("*").single();
 
   if(error) return res.status(500).json({ ok:false, error:error.message });
 
@@ -504,16 +582,8 @@ app.post("/admin/delete-user", requireAdmin, async (req, res) => {
   res.json({ ok:true });
 });
 
-/* =========================
-   ADMIN — PLANOS E PROMOÇÕES
-========================= */
-
 app.get("/admin/plan-prices", requireAdmin, async (req, res) => {
-  const { data, error } = await supabase
-    .from("bo_plan_prices")
-    .select("*")
-    .order("plan_days", { ascending:true });
-
+  const { data, error } = await supabase.from("bo_plan_prices").select("*").order("plan_days", { ascending:true });
   if(error) return res.status(500).json({ ok:false, error:error.message });
 
   const now = Date.now();
@@ -544,23 +614,14 @@ app.post("/admin/update-plan-price", requireAdmin, async (req, res) => {
     const normalPrice = Number(req.body.normalPrice);
     const normalPriceCents = Math.round(normalPrice * 100);
 
-    if(![30,60,90].includes(planDays)){
-      return res.status(400).json({ ok:false, error:"Plano inválido." });
-    }
+    if(![30,60,90].includes(planDays)) return res.status(400).json({ ok:false, error:"Plano inválido." });
+    if(!normalPriceCents || normalPriceCents < 100) return res.status(400).json({ ok:false, error:"Preço mínimo R$1,00." });
 
-    if(!normalPriceCents || normalPriceCents < 100){
-      return res.status(400).json({ ok:false, error:"Preço mínimo R$1,00." });
-    }
-
-    const { data, error } = await supabase
-      .from("bo_plan_prices")
-      .upsert({
-        plan_days: planDays,
-        normal_price_cents: normalPriceCents,
-        updated_at: new Date().toISOString()
-      }, { onConflict:"plan_days" })
-      .select("*")
-      .single();
+    const { data, error } = await supabase.from("bo_plan_prices").upsert({
+      plan_days: planDays,
+      normal_price_cents: normalPriceCents,
+      updated_at: new Date().toISOString()
+    }, { onConflict:"plan_days" }).select("*").single();
 
     if(error) throw error;
 
@@ -577,32 +638,19 @@ app.post("/admin/start-promo", requireAdmin, async (req, res) => {
     const promoPriceCents = Math.round(promoPrice * 100);
     const hours = Number(req.body.hours || 24);
 
-    if(![30,60,90].includes(planDays)){
-      return res.status(400).json({ ok:false, error:"Plano inválido." });
-    }
-
-    if(!promoPriceCents || promoPriceCents < 100){
-      return res.status(400).json({ ok:false, error:"Promoção mínima R$1,00." });
-    }
-
-    if(!hours || hours < 1){
-      return res.status(400).json({ ok:false, error:"Duração mínima de 1 hora." });
-    }
+    if(![30,60,90].includes(planDays)) return res.status(400).json({ ok:false, error:"Plano inválido." });
+    if(!promoPriceCents || promoPriceCents < 100) return res.status(400).json({ ok:false, error:"Promoção mínima R$1,00." });
+    if(!hours || hours < 1) return res.status(400).json({ ok:false, error:"Duração mínima de 1 hora." });
 
     const startsAt = new Date();
     const endsAt = new Date(Date.now() + hours * 60 * 60 * 1000);
 
-    const { data, error } = await supabase
-      .from("bo_plan_prices")
-      .update({
-        promo_price_cents: promoPriceCents,
-        promo_starts_at: startsAt.toISOString(),
-        promo_ends_at: endsAt.toISOString(),
-        updated_at: new Date().toISOString()
-      })
-      .eq("plan_days", planDays)
-      .select("*")
-      .single();
+    const { data, error } = await supabase.from("bo_plan_prices").update({
+      promo_price_cents: promoPriceCents,
+      promo_starts_at: startsAt.toISOString(),
+      promo_ends_at: endsAt.toISOString(),
+      updated_at: new Date().toISOString()
+    }).eq("plan_days", planDays).select("*").single();
 
     if(error) throw error;
 
@@ -616,21 +664,14 @@ app.post("/admin/stop-promo", requireAdmin, async (req, res) => {
   try{
     const planDays = Number(req.body.planDays);
 
-    if(![30,60,90].includes(planDays)){
-      return res.status(400).json({ ok:false, error:"Plano inválido." });
-    }
+    if(![30,60,90].includes(planDays)) return res.status(400).json({ ok:false, error:"Plano inválido." });
 
-    const { data, error } = await supabase
-      .from("bo_plan_prices")
-      .update({
-        promo_price_cents: null,
-        promo_starts_at: null,
-        promo_ends_at: null,
-        updated_at: new Date().toISOString()
-      })
-      .eq("plan_days", planDays)
-      .select("*")
-      .single();
+    const { data, error } = await supabase.from("bo_plan_prices").update({
+      promo_price_cents: null,
+      promo_starts_at: null,
+      promo_ends_at: null,
+      updated_at: new Date().toISOString()
+    }).eq("plan_days", planDays).select("*").single();
 
     if(error) throw error;
 
@@ -640,5 +681,79 @@ app.post("/admin/stop-promo", requireAdmin, async (req, res) => {
   }
 });
 
+app.get("/admin/free-promo", requireAdmin, async (req, res) => {
+  const { data, error } = await supabase
+    .from("bo_free_access_promos")
+    .select("*")
+    .order("created_at", { ascending:false })
+    .limit(10);
+
+  if(error) return res.status(500).json({ ok:false, error:error.message });
+
+  res.json({ ok:true, promos:data });
+});
+
+app.post("/admin/start-free-promo", requireAdmin, async (req, res) => {
+  try{
+    const freeDays = Number(req.body.freeDays || 30);
+    const extraSlots = Number(req.body.extraSlots || 10);
+    const hours = Number(req.body.hours || 24);
+
+    if(freeDays < 1) return res.status(400).json({ ok:false, error:"Dias grátis inválidos." });
+    if(extraSlots < 1) return res.status(400).json({ ok:false, error:"Vagas grátis inválidas." });
+    if(hours < 1) return res.status(400).json({ ok:false, error:"Duração mínima de 1 hora." });
+
+    const startsAt = new Date();
+    const endsAt = new Date(Date.now() + hours * 60 * 60 * 1000);
+
+    const { data, error } = await supabase
+      .from("bo_free_access_promos")
+      .insert({
+        enabled:true,
+        free_days:freeDays,
+        extra_slots:extraSlots,
+        used_slots:0,
+        starts_at:startsAt.toISOString(),
+        ends_at:endsAt.toISOString(),
+        updated_at:new Date().toISOString()
+      })
+      .select("*")
+      .single();
+
+    if(error) throw error;
+
+    res.json({ ok:true, promo:data });
+  }catch(error){
+    res.status(500).json({ ok:false, error:error.message });
+  }
+});
+
+app.post("/admin/stop-free-promo", requireAdmin, async (req, res) => {
+  try{
+    const promoId = req.body.promoId;
+
+    let query = supabase
+      .from("bo_free_access_promos")
+      .update({
+        enabled:false,
+        updated_at:new Date().toISOString()
+      });
+
+    if(promoId){
+      query = query.eq("id", promoId);
+    }else{
+      query = query.eq("enabled", true);
+    }
+
+    const { data, error } = await query.select("*");
+
+    if(error) throw error;
+
+    res.json({ ok:true, promos:data });
+  }catch(error){
+    res.status(500).json({ ok:false, error:error.message });
+  }
+});
+
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Biblioteca Obsidiana V2.4.1 online na porta ${port}`));
+app.listen(port, () => console.log(`Biblioteca Obsidiana V2.4.3 online na porta ${port}`));
